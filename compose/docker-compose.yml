@@ -1,0 +1,48 @@
+# One OpenBoxes stack: app + database + mail sink.
+# Driven by scripts/stack.sh, which sets every variable below. The project
+# name (compat-<label>) scopes containers, network and the database volume, so
+# a baseline and a candidate stack never share data.
+name: ${COMPOSE_PROJECT_NAME:?set by scripts/stack.sh}
+
+services:
+  db:
+    image: ${OB_DB_IMAGE:-mariadb:10.3.39}
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: openboxes
+      MYSQL_USER: openboxes
+      MYSQL_PASSWORD: openboxes
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test: mysqladmin ping -h localhost -u openboxes --password=openboxes
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  mailpit:
+    image: axllent/mailpit:v1.33.1
+    ports:
+      - '127.0.0.1:${OB_MAILPIT_PORT:-8025}:8025'
+
+  app:
+    # Published images are linux/amd64 only.
+    image: ${OB_IMAGE:?set by scripts/stack.sh}
+    platform: linux/amd64
+    depends_on:
+      db:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+    ports:
+      - '127.0.0.1:${OB_HTTP_PORT:-8080}:8080'
+    environment:
+      DATASOURCE_USERNAME: openboxes
+      DATASOURCE_PASSWORD: openboxes
+      DATASOURCE_URL: jdbc:mysql://db/openboxes?serverTimezone=UTC&useSSL=false
+      GRAILS_SERVER_URL: http://localhost:${OB_HTTP_PORT:-8080}/openboxes/
+      # The image default plus the suite flags, assembled by scripts/stack.sh.
+      JAVA_TOOL_OPTIONS: ${OB_JAVA_TOOL_OPTIONS:?set by scripts/stack.sh}
+
+volumes:
+  db-data:
