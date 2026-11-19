@@ -160,3 +160,97 @@ this repo comes first. This list covers what it can't check yet.
 - [ ] `required` Database backups are running
 - [ ] `required` A database backup can be restored
 - [ ] `verify` VM backups (Rimu) are running. Test a restore occasionally.
+
+## 13. Plugins, dependencies and framework behavior
+
+Each item has a manual check and the way to automate it. `$OLD` and `$NEW` are
+the baseline and candidate base URLs, for example `http://localhost:8080/openboxes`.
+
+### 13.1 `required` `G7` `new` URL matching (`.json` suffix and trailing slash)
+Spring 6 turns both off by default. Old URLs can start returning 404.
+- **Find callers:** `grep -rnE "\.json['\"?/]" src/js grails-app/views grails-app/assets`
+- **Manual:** for each URL, compare the status code on both images:
+  `curl -s -o /dev/null -w '%{http_code}\n' -b cookies.txt "$OLD/api/products.json"`, then the same URL on `$NEW`.
+  Repeat with a trailing slash, for example `/dashboard/`.
+- **Auto (`playwright`):** keep the URL list in `src/tests/api/url-matching.spec.ts`, record the status codes per image, and fail on any difference.
+
+### 13.2 `required` `new` Dependency and WAR diff
+- **Manual:** on both branches, run
+  `./gradlew dependencies --configuration runtimeClasspath > deps-$BRANCH.txt`, then
+  `diff deps-develop.txt deps-upgrade.txt`. Review every version change.
+- **WAR jars:** `unzip -Z1 build/libs/openboxes.war 'WEB-INF/lib/*' | sort > jars-$BRANCH.txt`, then diff the two lists.
+  Look for duplicates, such as two versions of the same jar, or a `javax` jar next to its `jakarta` replacement.
+- **Forced versions:** for each `force` line in `build.gradle`, run
+  `./gradlew dependencyInsight --configuration runtimeClasspath --dependency commons-io`.
+  Remove the force if the resolved version is now newer anyway.
+- **Auto (`ci`):** a CI job saves both lists as artifacts and posts the diff on the PR.
+
+### 13.3 `required` `new` Plugins with no other check
+| Plugin | Manual check | Pass when | Auto |
+|---|---|---|---|
+| `rendering` (PDF) | Find entry points: `grep -rn "pdfRenderingService\|renderPdf" grails-app`. Open one in the browser. | File starts with `%PDF-`, and there's no `MockHttpServletRequest` `ClassNotFoundException` in the log (OBS-372) | `playwright` |
+| `quartz-monitor` | Open `$NEW/quartz` as admin, then as a non-admin | Admin sees the job list. Non-admin is denied. | `playwright` |
+| `grails-console` | Open `$NEW/console` as admin and run `1 + 1`. Repeat as non-admin and logged out. | Admin gets `2`. Others are denied or redirected to login. | `playwright` |
+| `ajax-tags` | Find pages: `grep -rlnE "formRemote\|remoteLink\|remoteFunction" grails-app/views`. Click each link or form. | The request returns 200 and the target element updates | `playwright` (`waitForResponse`) |
+| `browser-detection` | Find pages: `grep -rn "browser:is" grails-app/views`. Load one with `curl -A "<Android UA>"` and with a desktop UA. | The two responses differ the same way on both images | `playwright` |
+
+### 13.4 `required` `new` Labels and barcodes
+- **Find:** `grep -rnE "zxing|BarcodeFormat|ZebraUtils|labelary" grails-app src/main`
+- **Barcode (zxing):** request the barcode image for a known value.
+  Pass when it returns `image/png` and `zbarimg barcode.png` decodes to the same value.
+- **ZPL (zebra-zpl):** generate a label.
+  Pass when the ZPL starts with `^XA` and ends with `^XZ`, and the Labelary preview returns a PNG.
+  If a Zebra printer is available, print one too.
+- **Auto (`playwright`):** compare the ZPL text from both images. It should match exactly.
+
+### 13.5 `required` `new` API clients
+- **openboxes-mobile:** point a dev build at `$NEW`. Run login → choose location → pick → pack.
+  Pass when there are no errors and the data matches the web UI.
+- **VVG eASN (n8n):** replay a known eASN CSV through the test n8n workflow against `$NEW`.
+  Pass when the resulting inbound shipment matches the one created on `$OLD`.
+- **Auto (`playwright`):** list the endpoints the mobile app calls, from its API client code, and add an API spec that checks each response shape on both images.
+
+### 13.6 `new` Dates and timezones (joda-time, jadira, jsr310)
+- **Manual:** create a shipment with expected date `2026-03-08` (US daylight-saving switch) and a lot expiring `2026-12-31`.
+  Check the dates in the UI, in the API JSON and in SQL (`SELECT expected_shipping_date FROM shipment WHERE id = ...`).
+- Repeat with the JVM set to `-Duser.timezone=UTC`, then `America/Chicago`.
+- **Pass when:** the same date shows everywhere, with no off-by-one day.
+- **Auto (`playwright`):** POST the dates, GET them back, and compare across images.
+
+### 13.7 `new` Character encoding
+- **Manual:** import a product CSV saved twice, once as UTF-8 and once as Windows-1252.
+  Use names like `Paracétamol 500 mg`, `Ибупрофен` and `डोलो`.
+- **Pass when:**
+  - the names look right in the UI
+  - `SELECT HEX(name)` shows `utf8mb4` bytes
+  - `pdftotext` on a product PDF contains the names
+- **Auto (`playwright`):** keep the fixture CSVs in the repo, import them, and check the names in the API response.
+
+### 13.8 `new` Caching (`@Cacheable`, ehcache)
+- **Find:** `grep -rn "@Cacheable\|@CacheEvict" grails-app src/main`
+- **Manual:** load a cached value, edit the record behind it, then reload.
+  Pass when the new value shows right away, or after the documented expiry.
+  The hit counts in Administration → Cache should also go up.
+
+### 13.9 `required` `G7` `new` Cookies, headers and sessions
+- **Manual:** compare the response headers on both images with `curl -sI "$NEW/" | sort`, then the same for `$OLD`.
+- After logging in, the `JSESSIONID` cookie should keep the same `Path`, `Secure`, `HttpOnly` and `SameSite` flags as before.
+- Leave a session idle past the configured timeout. The next click should redirect to login.
+- **Auto (`playwright`):** check the flags returned by `context.cookies()`, and diff the response headers between images.
+
+### 13.10 `required` `G7` `new` Health and release info
+- **Manual:** Spring Boot 3 moved the endpoints under `/actuator`.
+  - Check that `$OLD/health` and `$NEW/actuator/health` return `UP`.
+  - Check that `/info` (or `/actuator/info`) includes `git.commit.id`, matching the image's commit.
+- Trigger a test error and check that the Sentry event's `release` tag matches the commit.
+- Check whether any uptime monitors or load balancers poll `/health`. They need the new path.
+- **Auto (`playwright`):** API spec with a different path per image.
+
+## 14. `build.gradle` problems to fix
+
+- [ ] `required` `new` **OWASP check can never fail.** `failBuildOnCVSS = 11` is above the CVSS maximum of 10.
+  1. Run `./gradlew dependencyCheckAnalyze` and read `build/reports/dependency-check-report.html` to see the current count.
+  2. Set the threshold to `7`, and add suppressions for accepted findings.
+- [ ] `required` `G7` `new` **Java 8 pins.** Run `grep -nE "sourceCompatibility|targetCompatibility|asmVersion|jgit|toolVersion|version = '14" build.gradle gradle.properties`.
+  - Raise each one on the upgrade branch.
+  - Then `JAVA_HOME=<jdk17> ./gradlew clean build jacocoTestReport` should pass. Jacoco 0.7.6 fails on Java 17, which is the quickest way to confirm.
